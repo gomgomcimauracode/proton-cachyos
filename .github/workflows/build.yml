@@ -19,7 +19,7 @@ jobs:
         run: |
           pacman-key --init
           pacman-key --populate archlinux
-          pacman -Syu --noconfirm base-devel git sudo python ninja meson glslang perl-opencc
+          pacman -Syu --noconfirm base-devel git sudo python ninja meson glslang
           useradd -m builduser
           echo "builduser ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 
@@ -27,6 +27,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: 'recursive'
+          fetch-depth: 0
 
       - name: Clone Optimization Repositories
         run: |
@@ -43,7 +44,6 @@ jobs:
             echo '==> Applying NTDLL Sync Fast Paths Patch...'
             patch -p1 --fuzz=3 < /tmp/deadlock-opts/patches/wine/0002-ntdll-sync-fast-paths.patch || true
             
-            # Wineserver protokol yenileme
             if [ -f tools/make_requests ]; then
               echo '==> Updating Wineserver Protocol Requests...'
               ./tools/make_requests
@@ -63,13 +63,21 @@ jobs:
       - name: Prepare Steam Compatibility Tool Output
         run: |
           su builduser -c "
-            DIST_DIR='build/dist'
+            TARGET_DIR=''
             if [ -d 'build/proton-cachyos' ]; then
-              DIST_DIR='build/proton-cachyos'
+              TARGET_DIR='build/proton-cachyos'
+            elif [ -d 'build/dist' ]; then
+              TARGET_DIR='build/dist'
+            else
+              # Fallback to find any directory containing version/proton files
+              TARGET_DIR=\$(find build -maxdepth 2 -type d | grep -E 'proton|dist' | head -n 1)
             fi
-            
-            if [ -f \"\$DIST_DIR/version\" ]; then
-              echo 'Proton-CachyOS-Deadlock' > \"\$DIST_DIR/version\"
+
+            echo '==> Using target directory: \$TARGET_DIR'
+            if [ -n \"\$TARGET_DIR\" ] && [ -d \"\$TARGET_DIR\" ]; then
+              echo 'Proton-CachyOS-Deadlock' > \"\$TARGET_DIR/version\"
+            else
+              echo 'Warning: Could not locate built Proton directory!'
             fi
           "
 
@@ -77,4 +85,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Proton-CachyOS-Deadlock-x86_64_v3
-          path: build/dist/
+          path: |
+            build/proton-cachyos/
+            build/dist/
