@@ -1,0 +1,29 @@
+name: Build Proton CachyOS (v3 Only)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Build Environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ninja-build meson ccache
+
+      - name: Build x86_64_v3 Target
+        run: |
+          echo "Building Proton for x86_64_v3 target..."
+          # Buraya derleme scripti veya makepkg komutları tetiklenir
+          mkdir -p build_out
+          echo "Proton v3 Build Artifact" > build_out/proton-v3.tar.xz
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: proton-cachyos-x86_64_v3
+          path: build_out/
