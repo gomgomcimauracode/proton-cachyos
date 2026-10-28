@@ -1,4 +1,4 @@
-name: Build Proton-CachyOS-Deadlock (v3)
+name: Build Proton-CachyOS-Deadlock (Source)
 
 on:
   workflow_dispatch:
@@ -8,18 +8,20 @@ on:
       - cachyos_*_*/main
 
 jobs:
-  build-deadlock-proton:
+  build-proton-source:
     runs-on: ubuntu-latest
     container:
       image: archlinux:latest
       options: --privileged
 
     steps:
-      - name: Configure Pacman & Install Dependencies
+      - name: Configure Pacman & Install Proton Build Dependencies
         run: |
           pacman-key --init
           pacman-key --populate archlinux
-          pacman -Syu --noconfirm base-devel git sudo python ninja meson glslang zstd
+          pacman -Syu --noconfirm base-devel git sudo python ninja meson glslang zstd \
+            mingw-w64-gcc mingw-w64-headers mingw-w64-crt mingw-w64-tools \
+            flex bison gettext perl freetype2 fontconfig libgl alsa-lib libx11 libxcursor libxi libxrandr libxxf86vm
           useradd -m builduser
           echo "builduser ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 
@@ -46,33 +48,42 @@ jobs:
               patch -p1 --fuzz=3 < /tmp/deadlock-opts/patches/wine/0002-ntdll-sync-fast-paths.patch || true
               
               if [ -f tools/make_requests ]; then
-                echo '==> Updating Wineserver Protocol Requests...'
+                echo '==> Updating Wineserver Protocol Requests subdirectory...'
                 ./tools/make_requests
               fi
             fi
           "
 
-      - name: Build Proton-CachyOS via makepkg (Optimized for x86_64_v3)
+      - name: Configure and Build Proton from Source (x86_64_v3)
         run: |
           chown -R builduser:builduser .
           su builduser -c "
             export CFLAGS='-O3 -march=x86-64-v3 -mtune=core-avx2 -pipe -fno-plt -flto=auto'
             export CXXFLAGS='-O3 -march=x86-64-v3 -mtune=core-avx2 -pipe -fno-plt -flto=auto'
             
-            makepkg -s --noconfirm --skippgpcheck
+            echo '==> Running configure script...'
+            ./configure.sh --prefix=/app/dist
+            
+            echo '==> Starting parallel compilation...'
+            make -j$(nproc)
           "
 
-      - name: Prepare Steam Compatibility Tool Output
+      - name: Package Compatibility Tool
         run: |
+          su builduser -c "
+            make install
+          "
+          # Paketleme veya çıktıları toplama adımı
           mkdir -p build/dist
-          find . -maxdepth 1 -name "*.pkg.tar.zst" -exec tar -I zstd -xf {} -C build/dist/ \;
-          
-          if [ -d "build/dist" ]; then
-            echo "Proton-CachyOS-Deadlock" > build/dist/version
+          if [ -d "/app/dist" ]; then
+            cp -r /app/dist/* build/dist/
+          else
+            # Eğer dist başka bir yere çıkıyorsa mevcut dizindeki çıktıyı al
+            cp -r dist/* build/dist/ 2>/dev/null || true
           fi
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Proton-CachyOS-Deadlock-x86_64_v3
+          name: Proton-CachyOS-Deadlock-Source-x86_64_v3
           path: build/dist/
