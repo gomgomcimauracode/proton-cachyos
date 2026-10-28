@@ -2,6 +2,11 @@ name: Build Proton-CachyOS-Deadlock (Source)
 
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch to build'
+        required: false
+        default: 'cachyos_11.0_20261014/main'
   push:
     branches:
       - cachyos_main
@@ -28,12 +33,25 @@ jobs:
           useradd -m builduser
           echo "builduser ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
           mkdir -p /app/dist && chown -R builduser:builduser /app/dist
+          git config --system --add safe.directory '*'
 
       - name: Checkout Repository (Submodules Included)
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.ref || github.ref_name }}
           submodules: 'recursive'
           fetch-depth: 0
+
+      - name: Verify Repository Root
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          echo "==> Workspace: $(pwd)"
+          echo "==> Branch: $(git branch --show-current || git rev-parse --abbrev-ref HEAD)"
+          if [ ! -x ./configure.sh ] || [ ! -f ./Makefile ]; then
+            echo "ERROR: configure.sh or Makefile not found in repository root."
+            ls -la
+            exit 1
+          fi
 
       - name: Clone Optimization Repositories
         run: |
@@ -41,14 +59,18 @@ jobs:
 
       - name: Apply All Compatible Low-Latency Patches
         run: |
-          chown -R builduser:builduser . /tmp/deadlock-opts
+          cd "$GITHUB_WORKSPACE"
+          chown -R builduser:builduser "$GITHUB_WORKSPACE" /tmp/deadlock-opts
           su builduser -c "
+            cd '$GITHUB_WORKSPACE'
             if [ -d 'wine' ]; then
               cd wine
               echo '==> Applying Socket SHM Polling Patch...'
               patch -p1 < /tmp/deadlock-opts/patches/wine/0003-socket-shm-polling.patch || true
+
               echo '==> Applying NTDLL Sync Fast Paths Patch...'
               patch -p1 --fuzz=3 < /tmp/deadlock-opts/patches/wine/0002-ntdll-sync-fast-paths.patch || true
+
               if [ -f tools/make_requests ]; then
                 echo '==> Updating Wineserver Protocol Requests...'
                 ./tools/make_requests
@@ -58,25 +80,33 @@ jobs:
 
       - name: Configure and Build Proton from Source (x86_64_v3)
         run: |
-          chown -R builduser:builduser .
+          cd "$GITHUB_WORKSPACE"
+          chown -R builduser:builduser "$GITHUB_WORKSPACE"
           su builduser -c "
+            cd '$GITHUB_WORKSPACE'
             export CFLAGS='-O3 -march=x86-64-v3 -mtune=core-avx2 -pipe -fno-plt -flto=auto'
             export CXXFLAGS='-O3 -march=x86-64-v3 -mtune=core-avx2 -pipe -fno-plt -flto=auto'
+
             echo '==> Running configure script...'
             ./configure.sh --prefix=/app/dist
+
             echo '==> Starting parallel compilation...'
             make -j$(nproc)
           "
 
       - name: Package Compatibility Tool
         run: |
+          cd "$GITHUB_WORKSPACE"
           su builduser -c "
+            cd '$GITHUB_WORKSPACE'
             make install
           "
+          # Paketleme veya çıktıları toplama adımı
           mkdir -p build/dist
           if [ -d "/app/dist" ]; then
             cp -r /app/dist/* build/dist/
           else
+            # Eğer dist başka bir yere çıkıyorsa mevcut dizindeki çıktıyı al
             cp -r dist/* build/dist/ 2>/dev/null || true
           fi
 
