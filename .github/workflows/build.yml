@@ -4,112 +4,298 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 'Branch to build'
+        description: 'Branch to build (empty = newest cachyos_*_*/main)'
         required: false
-        default: 'cachyos_11.0_20261014/main'
+        default: ''
+      optimize_haswell:
+        description: 'Replace -march=nocona with -march=haswell (x86-64-v3 class)'
+        type: boolean
+        default: true
+      strict_patches:
+        description: 'Fail the build if a patch does not apply'
+        type: boolean
+        default: true
   push:
     branches:
       - cachyos_main
       - cachyos_*_*/main
 
+concurrency:
+  group: proton-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  FALLBACK_REF: cachyos_11.0_20261014/main
+  BUILD_NAME: cachyos-deadlock
+  OPTS_REPO: https://github.com/itchyfeetleech/deadlock-linux-optimizations.git
+  DEBIAN_FRONTEND: noninteractive
+  GIT_TERMINAL_PROMPT: '0'
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build-proton-source:
-    runs-on: ubuntu-latest
-    container:
-      image: archlinux:latest
-      options: --privileged
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
 
     steps:
-      - name: Configure Pacman & Install Proton Build Dependencies
+      - name: Resolve source branch
+        id: ref
+        env:
+          INPUT_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || '' }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          pacman-key --init
-          pacman-key --populate archlinux
-          pacman -Syu --noconfirm base-devel git sudo python ninja meson glslang zstd \
-            autoconf automake libtool ccache make gcc pkgconf patch cmake nasm \
-            curl wget rsync unzip \
-            mingw-w64-gcc mingw-w64-headers mingw-w64-crt mingw-w64-winpthreads \
-            flex bison gettext perl freetype2 fontconfig libgl alsa-lib \
-            libx11 libxcursor libxi libxrandr libxxf86vm
-          useradd -m builduser
-          echo "builduser ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-          mkdir -p /app/dist && chown -R builduser:builduser /app/dist
-          git config --system --add safe.directory '*'
+          ref="${INPUT_REF:-$GITHUB_REF_NAME}"
+          if [ "$ref" = "cachyos_main" ]; then
+            # cachyos_main only holds docs; build the newest source branch instead
+            latest=$(git ls-remote --heads "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+              | awk '{print $2}' \
+              | sed 's,^refs/heads/,,' \
+              | grep -E '^cachyos_[0-9.]+_[0-9]+/main$' \
+              | sort -V | tail -n1 || true)
+            ref="${latest:-$FALLBACK_REF}"
+          fi
+          echo "==> Building branch: $ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Free disk space and add swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift \
+            /usr/local/julia* /usr/share/miniconda /opt/microsoft /usr/local/share/powershell
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+
+          if sudo swapoff -a && sudo fallocate -l 8G /mnt/proton.swap \
+             && sudo chmod 600 /mnt/proton.swap && sudo mkswap /mnt/proton.swap >/dev/null \
+             && sudo swapon /mnt/proton.swap; then
+            echo "==> Swap enabled"
+          else
+            echo "::warning::Could not enable swap; LTO/link steps may hit OOM"
+          fi
+
+          avail=$(df --output=avail -BG / | tail -n1 | tr -dc '0-9')
+          echo "==> Free space on /: ${avail}G"
+          if [ "$avail" -lt 40 ]; then
+            echo "::warning::Less than 40G free; the build may run out of disk"
+          fi
+          free -h
 
       - name: Checkout Repository (Submodules Included)
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || (github.ref_name == 'cachyos_main' && 'cachyos_11.0_20261014/main' || github.ref_name) }}
+          ref: ${{ steps.ref.outputs.ref }}
           submodules: 'recursive'
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Verify Repository Root
         run: |
           cd "$GITHUB_WORKSPACE"
           echo "==> Workspace: $(pwd)"
           echo "==> HEAD: $(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD)"
+          [ -f configure.sh ] && chmod +x configure.sh
           if [ ! -x ./configure.sh ] || [ ! -f ./Makefile ]; then
-            echo "ERROR: configure.sh or Makefile not found in repository root."
+            echo "::error::configure.sh or Makefile not found in repository root."
+            ls -la
+            exit 1
+          fi
+          if git submodule status --recursive | grep -q '^-'; then
+            echo "::error::Some submodules were not initialized:"
+            git submodule status --recursive | grep '^-'
+            exit 1
+          fi
+          docker --version
+          docker info --format 'Docker server {{.ServerVersion}} (storage: {{.Driver}})'
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.ccache
+            ~/.cache/ccache
+          key: ccache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
+
+      - name: Apply Low-Latency Patches
+        env:
+          STRICT: ${{ github.event_name != 'workflow_dispatch' || inputs.strict_patches }}
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          git clone --depth 1 "$OPTS_REPO" /tmp/deadlock-opts
+
+          if [ ! -d wine ]; then
+            echo "::error::wine directory not found in repository root."
+            exit 1
+          fi
+          cd wine
+
+          failed=0
+          changed=0
+          apply_patch() {
+            local file="$1" fuzz="$2" name
+            name=$(basename "$file")
+            if [ ! -f "$file" ]; then
+              echo "::error::Patch file not found: $file"
+              ls -R /tmp/deadlock-opts/patches 2>/dev/null | head -40
+              return 1
+            fi
+            if patch -p1 -R -f --dry-run --fuzz=0 < "$file" >/dev/null 2>&1; then
+              echo "==> Already applied: $name"
+              return 0
+            fi
+            if patch -p1 -f --dry-run --fuzz="$fuzz" < "$file" >/dev/null 2>&1; then
+              patch -p1 --no-backup-if-mismatch --fuzz="$fuzz" < "$file"
+              echo "==> Applied: $name"
+              changed=1
+              return 0
+            fi
+            echo "::warning::Patch does not apply cleanly: $name"
+            return 1
+          }
+
+          apply_patch /tmp/deadlock-opts/patches/wine/0003-socket-shm-polling.patch 2 || failed=1
+          apply_patch /tmp/deadlock-opts/patches/wine/0002-ntdll-sync-fast-paths.patch 3 || failed=1
+
+          if [ "$failed" -ne 0 ]; then
+            if [ "$STRICT" = "true" ]; then
+              echo "::error::At least one patch failed and strict mode is on."
+              exit 1
+            fi
+            echo "::warning::Continuing without the failed patch(es)."
+          fi
+
+          if [ "$changed" -eq 1 ] && [ -x tools/make_requests ]; then
+            echo "==> Regenerating wineserver protocol files..."
+            ./tools/make_requests
+          fi
+
+      - name: Configure Proton Build
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p "build/$BUILD_NAME"
+          cd "build/$BUILD_NAME"
+          for attempt in 1 2 3; do
+            if ../../configure.sh --build-name="$BUILD_NAME" --enable-ccache; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::configure.sh failed after 3 attempts"
+              exit 1
+            fi
+            echo "==> configure.sh failed (attempt $attempt), retrying in 20s (registry/network hiccup?)"
+            sleep 20
+          done
+          if [ ! -f Makefile ]; then
+            echo "::error::configure.sh finished but no Makefile was generated."
             ls -la
             exit 1
           fi
 
-      - name: Clone Optimization Repositories
+      - name: Tune optimization flags (x86-64-v3 class)
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.optimize_haswell }}
         run: |
-          git clone https://github.com/itchyfeetleech/deadlock-linux-optimizations.git /tmp/deadlock-opts
+          cd "$GITHUB_WORKSPACE/build/$BUILD_NAME"
+          echo "==> Current -march settings:"
+          grep -n -- '-march=' Makefile || true
+          if grep -q -- '-march=nocona' Makefile; then
+            sed -i 's/-march=nocona/-march=haswell/g' Makefile
+            echo "==> Replaced -march=nocona with -march=haswell"
+          else
+            echo "::warning::-march=nocona not found in generated Makefile; flags left unchanged."
+          fi
 
-      - name: Apply All Compatible Low-Latency Patches
+      - name: Build Proton
+        id: build
+        timeout-minutes: 330
         run: |
-          cd "$GITHUB_WORKSPACE"
-          chown -R builduser:builduser "$GITHUB_WORKSPACE" /tmp/deadlock-opts
-          su builduser -c "
-            cd '$GITHUB_WORKSPACE'
-            if [ -d 'wine' ]; then
-              cd wine
-              echo '==> Applying Socket SHM Polling Patch...'
-              patch -p1 < /tmp/deadlock-opts/patches/wine/0003-socket-shm-polling.patch || true
+          cd "$GITHUB_WORKSPACE/build/$BUILD_NAME"
+          target=""
+          for t in redist dist; do
+            if make -n "$t" >/dev/null 2>&1; then target="$t"; break; fi
+          done
+          if [ -z "$target" ]; then
+            echo "::error::Neither 'redist' nor 'dist' make target exists. Available targets:"
+            make -pRrq : 2>/dev/null | awk -F: '/^[a-zA-Z0-9][^$#\/\t=]*:([^=]|$)/ {print $1}' | sort -u | head -50 || true
+            exit 1
+          fi
+          echo "==> Building target: $target with $(nproc) jobs"
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+          make -j"$(nproc)" "$target" 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
 
-              echo '==> Applying NTDLL Sync Fast Paths Patch...'
-              patch -p1 --fuzz=3 < /tmp/deadlock-opts/patches/wine/0002-ntdll-sync-fast-paths.patch || true
-
-              if [ -f tools/make_requests ]; then
-                echo '==> Updating Wineserver Protocol Requests...'
-                ./tools/make_requests
-              fi
-            fi
-          "
-
-      - name: Configure and Build Proton from Source (x86_64_v3)
+      - name: Fix workspace ownership
+        if: always()
         run: |
-          cd "$GITHUB_WORKSPACE"
-          chown -R builduser:builduser "$GITHUB_WORKSPACE"
-          su builduser -c "
-            cd '$GITHUB_WORKSPACE'
-            export CFLAGS='-O3 -march=x86-64-v3 -mtune=core-avx2 -pipe -fno-plt -flto=auto'
-            export CXXFLAGS='-O3 -march=x86-64-v3 -mtune=core-avx2 -pipe -fno-plt -flto=auto'
+          sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE" || true
+          du -sh ~/.ccache ~/.cache/ccache 2>/dev/null || echo "==> No ccache directory found in the usual places"
 
-            echo '==> Running configure script...'
-            ./configure.sh --prefix=/app/dist
-
-            echo '==> Starting parallel compilation...'
-            make -j$(nproc)
-          "
+      - name: Save ccache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.ccache
+            ~/.cache/ccache
+          key: ccache-${{ runner.os }}-${{ github.run_id }}
 
       - name: Package Compatibility Tool
         run: |
-          cd "$GITHUB_WORKSPACE"
-          su builduser -c "
-            cd '$GITHUB_WORKSPACE'
-            make install
-          "
-          mkdir -p build/dist
-          if [ -d "/app/dist" ]; then
-            cp -r /app/dist/* build/dist/
-          else
-            cp -r dist/* build/dist/ 2>/dev/null || true
+          cd "$GITHUB_WORKSPACE/build/$BUILD_NAME"
+          target="${{ steps.build.outputs.target }}"
+
+          vdf=$(find "./$target" -maxdepth 3 -name compatibilitytool.vdf 2>/dev/null | head -n1 || true)
+          if [ -z "$vdf" ]; then
+            vdf=$(find . -maxdepth 4 -name compatibilitytool.vdf 2>/dev/null | sort | head -n1 || true)
           fi
+          if [ -z "$vdf" ]; then
+            echo "::error::compatibilitytool.vdf not found; build output layout is not what was expected."
+            ls -la
+            find . -maxdepth 2 -type d | head -50
+            exit 1
+          fi
+
+          dist_dir=$(dirname "$vdf")
+          echo "==> Packaging: $dist_dir"
+
+          command -v zstd >/dev/null || sudo apt-get install -y -qq zstd
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          sha=$(git -C "$GITHUB_WORKSPACE" rev-parse --short HEAD)
+          archive="$GITHUB_WORKSPACE/out/proton-cachyos-deadlock-${sha}.tar.zst"
+
+          tar -C "$(dirname "$dist_dir")" \
+              --transform "s,^$(basename "$dist_dir"),proton-cachyos-deadlock," \
+              -cf - "$(basename "$dist_dir")" \
+            | zstd -T0 -10 -q -o "$archive"
+
+          ls -lh "$GITHUB_WORKSPACE/out"
+          {
+            echo "### Proton-CachyOS-Deadlock build"
+            echo "- Branch: \`${{ steps.ref.outputs.ref }}\` @ \`$sha\`"
+            echo "- Make target: \`$target\`"
+            echo "- Archive: \`$(basename "$archive")\` ($(du -h "$archive" | cut -f1))"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Proton-CachyOS-Deadlock-Source-x86_64_v3
-          path: build/dist/
+          name: Proton-CachyOS-Deadlock-${{ github.run_number }}
+          path: out/*.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_number }}
+          path: |
+            build.log
+            build/${{ env.BUILD_NAME }}/*.log
+          if-no-files-found: ignore
+          retention-days: 7
