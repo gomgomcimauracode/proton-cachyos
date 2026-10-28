@@ -38,7 +38,7 @@ jobs:
       - name: Checkout Repository (Submodules Included)
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref_name }}
+          ref: ${{ inputs.ref || (github.ref_name == 'cachyos_main' && 'cachyos_11.0_20261014/main' || github.ref_name) }}
           submodules: 'recursive'
           fetch-depth: 0
 
@@ -46,7 +46,7 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE"
           echo "==> Workspace: $(pwd)"
-          echo "==> Branch: $(git branch --show-current || git rev-parse --abbrev-ref HEAD)"
+          echo "==> HEAD: $(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD)"
           if [ ! -x ./configure.sh ] || [ ! -f ./Makefile ]; then
             echo "ERROR: configure.sh or Makefile not found in repository root."
             ls -la
@@ -101,12 +101,10 @@ jobs:
             cd '$GITHUB_WORKSPACE'
             make install
           "
-          # Paketleme veya çıktıları toplama adımı
           mkdir -p build/dist
           if [ -d "/app/dist" ]; then
             cp -r /app/dist/* build/dist/
           else
-            # Eğer dist başka bir yere çıkıyorsa mevcut dizindeki çıktıyı al
             cp -r dist/* build/dist/ 2>/dev/null || true
           fi
 
