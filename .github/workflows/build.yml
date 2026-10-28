@@ -1,0 +1,89 @@
+name: Build Proton-CachyOS-Deadlock
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - cachyos_11.0_20261014/main
+  pull_request:
+    branches:
+      - cachyos_11.0_20261014/main
+
+jobs:
+  build:
+    name: Build Proton-CachyOS-Deadlock
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+      options: --privileged
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Sy --noconfirm base-devel git sudo python ninja meson glslang
+
+      - name: Create builduser with passwordless sudo
+        run: |
+          useradd -m -G wheel builduser
+          echo 'builduser ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builduser
+          chmod 440 /etc/sudoers.d/builduser
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          submodules: false
+
+      - name: Initialize submodules
+        run: |
+          git submodule update --init --filter=tree:0 --recursive
+
+      - name: Clone Deadlock optimization patches
+        run: |
+          git clone https://github.com/itchyfeetleech/deadlock-linux-optimizations.git /tmp/deadlock-linux-optimizations
+
+      - name: Apply Deadlock optimization patches
+        run: |
+          cd wine
+          patch -p1 < /tmp/deadlock-linux-optimizations/patches/wine/0003-socket-shm-polling.patch
+          patch -p1 --fuzz=3 < /tmp/deadlock-linux-optimizations/patches/wine/0002-ntdll-sync-fast-paths.patch
+          ./tools/make_requests
+          cd ..
+
+      - name: Create build directory
+        run: |
+          mkdir -p build
+
+      - name: Configure build
+        working-directory: ./build
+        env:
+          CFLAGS: -march=x86-64-v3 -mtune=core-avx2 -O3 -pipe -fno-plt -flto=auto
+          CXXFLAGS: -march=x86-64-v3 -mtune=core-avx2 -O3 -pipe -fno-plt -flto=auto
+        run: |
+          ../configure.sh --enable-single-make --build-name=Proton-CachyOS-Deadlock
+
+      - name: Build Proton
+        working-directory: ./build
+        run: |
+          make proton
+
+      - name: Locate output and prepare artifact
+        run: |
+          if [ -d "build/proton-cachyos" ]; then
+            OUTPUT_DIR="build/proton-cachyos"
+          elif [ -d "build/dist" ]; then
+            OUTPUT_DIR="build/dist"
+          else
+            echo "Error: Could not find output directory"
+            exit 1
+          fi
+          echo "Proton-CachyOS-Deadlock" > "$OUTPUT_DIR/version"
+          echo "Output directory: $OUTPUT_DIR"
+          echo "OUTPUT_DIR=$OUTPUT_DIR" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Proton-CachyOS-Deadlock
+          path: ${{ env.OUTPUT_DIR }}
