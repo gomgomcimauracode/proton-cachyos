@@ -106,6 +106,8 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
+      # Only needed for patches whose source is "opts:" in patches/series.conf
+      # (currently the aggressive-tier ones). Local patches do not use it.
       - name: Checkout optimization patches
         uses: actions/checkout@v4
         with:
@@ -150,6 +152,20 @@ jobs:
           STRICT: ${{ inputs.strict_patches || 'false' }}
         run: bash ci/scripts/apply-patches.sh
 
+      # Patches are optional in series.conf, so a skipped one would only show up in the report.
+      # Surface the ones we care about right here, hours before the build would finish.
+      - name: Check key patches were applied
+        run: |
+          echo "==> Applied patches:"
+          cat patches-applied.txt 2>/dev/null || echo "(none)"
+          if [ "$PROFILE" != "stable" ]; then
+            for p in 0002-ntdll-sync-fast-paths 0100-igpu-launcher-tuning 0101-mem-env-defaults; do
+              if ! grep -qx "$p" patches-applied.txt 2>/dev/null; then
+                echo "::warning::Expected patch '$p' was NOT applied. See the patch report in the job summary."
+              fi
+            done
+          fi
+
       # ---------- 4. Configure ----------
       - name: Configure Proton build
         working-directory: src
@@ -184,13 +200,17 @@ jobs:
         timeout-minutes: 330
         working-directory: src/build/cachyos-deadlock
         run: |
+          # List the real make targets instead of probing with `make -n`: a dry run can fail
+          # for unrelated reasons (nested $(MAKE) calls, container checks) and then looks
+          # exactly like a missing target.
+          targets=$(make -pRrq : 2>/dev/null | awk -F: '/^[a-zA-Z0-9][^$#\/\t=]*:([^=]|$)/ {print $1}' | sort -u)
           target=""
           for t in redist dist; do
-            if make -n "$t" >/dev/null 2>&1; then target="$t"; break; fi
+            if echo "$targets" | grep -qx "$t"; then target="$t"; break; fi
           done
           if [ -z "$target" ]; then
             echo "::error::Neither 'redist' nor 'dist' target exists. Available targets:"
-            make -pRrq : 2>/dev/null | awk -F: '/^[a-zA-Z0-9][^$#\/\t=]*:([^=]|$)/ {print $1}' | sort -u | head -50 || true
+            echo "$targets" | head -50
             exit 1
           fi
           echo "target=$target" >> "$GITHUB_OUTPUT"
