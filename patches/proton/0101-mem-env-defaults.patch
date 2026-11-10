@@ -1,0 +1,12 @@
+--- a/proton
++++ b/proton
+@@ -2297,2 +2297,9 @@
+ 
++        # --- memory-bandwidth friendly defaults (opt-out: PROTON_NO_MEM_TUNING=1) ---
++        if "PROTON_NO_MEM_TUNING" not in self.env:
++            self.env.setdefault("MESA_SHADER_CACHE_MAX_SIZE", "10G")
++            self.env.setdefault("mesa_glthread", "true")
++            if "GLIBC_TUNABLES" not in self.env:
++                self.env["GLIBC_TUNABLES"] = "glibc.malloc.hugetlb=1"
++
+         if "__GLVND_DISALLOW_PATCHING" not in self.env:
