@@ -1,0 +1,25 @@
+--- a/proton
++++ b/proton
+@@ -2067,4 +2067,22 @@
+             append_to_env_str(self.env, "DXVK_CONFIG", "dxvk.enableGraphicsPipelineLibrary=Auto", ";")
+ 
++        # --- iGPU/low-core profile: less memory pressure, one thread per physical core ---
++        if "PROTON_NO_IGPU_TUNING" not in self.env:
++            if "dxgi.maxDeviceMemory" not in self.env.get("DXVK_CONFIG", ""):
++                append_to_env_str(self.env, "DXVK_CONFIG", "dxgi.maxDeviceMemory=3072", ";")
++            if "d3d9.maxFrameLatency" not in self.env.get("DXVK_CONFIG", ""):
++                append_to_env_str(self.env, "DXVK_CONFIG", "d3d9.maxFrameLatency=1", ";")
++            if "PROTON_NO_SMT_PIN" not in self.env:
++                try:
++                    cores = set()
++                    for cpu in sorted(os.sched_getaffinity(0)):
++                        with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list") as f:
++                            first = int(f.read().strip().replace("-", ",").split(",")[0])
++                        cores.add(first)
++                    if 2 <= len(cores) < len(os.sched_getaffinity(0)):
++                        os.sched_setaffinity(0, cores)
++                except Exception:
++                    pass
++
+         if "nvidialibs" in self.compat_config:
+             self.compat_config.add("nvcuda")
